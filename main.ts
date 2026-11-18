@@ -23,6 +23,14 @@
 // a long washout produces one entry, not one per bar; a crossing that lands
 // inside the cooldown is remembered, not lost. Exits are re-evaluated on
 // every bar while holding, so a rejected sell is re-decided next bar.
+//
+// Guardrail fallback: if the main rule has still filled nothing by scored
+// bar 1200 (a window with no deep washout at all), a shallower dip rule
+// arms itself so the entry can still meet the race window's minimum-trade
+// guardrail instead of sitting out the whole window. It uses the same
+// crossing logic with a 120-bar high and a 70 bp dip, tight 50 bp take
+// profit / 60 bp stop / 60-bar exits, and never fires on a window where
+// the main rule already traded (the dev window included).
 
 import { runBars } from './vendor/makefun-bars.ts';
 import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
@@ -39,6 +47,15 @@ const COOLDOWN_BARS = 30;
 const LAST_ENTRY_SEQ = 1380;
 const MAX_SLIPPAGE_BPS = 100;
 const MIN_NOTIONAL = 1000000n; // 1 USDC in quote units
+// Fallback rule (see the header comment).
+const FB_ARM_SEQ = 1200;
+const FB_LOOKBACK_BARS = 120;
+const FB_DIP_BPS = 70n;
+const FB_TAKE_PROFIT_BPS = 50n;
+const FB_STOP_BPS = 60n;
+const FB_MAX_HOLD_BARS = 60;
+const FB_COOLDOWN_BARS = 10;
+const FB_LAST_ENTRY_SEQ = 1420;
 
 // Closes of CBBTC bars in the order received (one per bar that exists).
 const closes: bigint[] = [];
@@ -55,16 +72,24 @@ let entryPrice: bigint | null = null;
 let entrySeq = -1;
 // Highest close seen since the open position's buy was decided.
 let peakClose = 0n;
+// Own filled orders so far (either side, harness closes excluded).
+let fillsCount = 0;
+// Which rule opened the current position, and which rule the outstanding
+// buy decision (if any) belongs to.
+let entryKind: 'main' | 'fallback' | null = null;
+let pendingKind: 'main' | 'fallback' | null = null;
+// Crossing memory for the fallback rule, kept apart from the main rule's.
+let prevFbDipped = false;
 
 function scoredSeq(state: BarsState): number {
   return state.seq - state.warmupBars;
 }
 
-function rollingHigh(): bigint | null {
-  // Max of the LOOKBACK_BARS closes strictly before the current bar.
-  if (closes.length <= LOOKBACK_BARS) return null;
-  let high = closes[closes.length - 1 - LOOKBACK_BARS]!;
-  for (let i = closes.length - LOOKBACK_BARS; i < closes.length - 1; i++) {
+function rollingHigh(lookback: number): bigint | null {
+  // Max of the `lookback` closes strictly before the current bar.
+  if (closes.length <= lookback) return null;
+  let high = closes[closes.length - 1 - lookback]!;
+  for (let i = closes.length - lookback; i < closes.length - 1; i++) {
     if (closes[i]! > high) high = closes[i]!;
   }
   return high;
@@ -77,15 +102,19 @@ await runBars({
     for (const fill of batch.fills) {
       if (fill.status !== 'filled' || fill.client_id.startsWith('_')) continue;
       if (fill.symbol !== SYMBOL) continue;
+      fillsCount++;
       if (fill.side === 'buy') {
         entryPrice = BigInt(fill.price);
         entrySeq = fill.decided_bar - state.warmupBars;
+        entryKind = pendingKind ?? 'main';
+        pendingKind = null;
         // Peak starts at the close of the bar the buy was decided on: the
         // last close recorded before this batch's bar.
         peakClose = closes.length > 0 ? closes[closes.length - 1]! : entryPrice;
       } else if (fill.side === 'sell') {
         entryPrice = null;
         entrySeq = -1;
+        entryKind = null;
         peakClose = 0n;
       }
     }
@@ -98,7 +127,7 @@ await runBars({
 
     // Dip evaluation for this bar (null while history builds or warming
     // up: warm-up bars only build history, they never arm or reset).
-    const high = state.warmingUp ? null : rollingHigh();
+    const high = state.warmingUp ? null : rollingHigh(LOOKBACK_BARS);
     const isDipped = high === null ? null : close * BPS <= high * (BPS - DIP_BPS);
     if (isDipped === false) prevDipped = false;
 
@@ -111,30 +140,59 @@ await runBars({
         // the exits at this close rather than holding without any exit.
         entryPrice = close;
         entrySeq = seq;
+        entryKind = 'main';
         peakClose = close;
         return [];
       }
       if (close > peakClose) peakClose = close;
       const entry = entryPrice;
-      const stopHit = close * BPS <= entry * (BPS - STOP_BPS);
-      const profitHit = close * BPS >= entry * (BPS + TAKE_PROFIT_BPS);
-      const trailHit = peakClose > entry && close * BPS <= peakClose * (BPS - TRAIL_BPS);
-      const stale = seq - entrySeq >= MAX_HOLD_BARS;
+      const fallback = entryKind === 'fallback';
+      const takeProfit = fallback ? FB_TAKE_PROFIT_BPS : TAKE_PROFIT_BPS;
+      const stop = fallback ? FB_STOP_BPS : STOP_BPS;
+      const maxHold = fallback ? FB_MAX_HOLD_BARS : MAX_HOLD_BARS;
+      const stopHit = close * BPS <= entry * (BPS - stop);
+      const profitHit = close * BPS >= entry * (BPS + takeProfit);
+      const trailHit = !fallback && peakClose > entry && close * BPS <= peakClose * (BPS - TRAIL_BPS);
+      const stale = seq - entrySeq >= maxHold;
       if (stopHit || profitHit || trailHit || stale) {
-        cooldownUntil = seq + 1 + COOLDOWN_BARS;
+        cooldownUntil = seq + 1 + (fallback ? FB_COOLDOWN_BARS : COOLDOWN_BARS);
         return [{ side: 'sell', symbol: SYMBOL, qty: held!.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
 
-    // Flat: consider an entry.
-    if (isDipped === null || isDipped === false) return [];
-    if (seq < cooldownUntil) return [];
-    if (seq > LAST_ENTRY_SEQ) return [];
-    if (state.cash < MIN_NOTIONAL) return [];
-    const crossing = !prevDipped;
-    prevDipped = true;
-    if (!crossing) return [];
+    // Flat: consider the main entry first.
+    if (isDipped === true) {
+      if (seq >= cooldownUntil && seq <= LAST_ENTRY_SEQ && state.cash >= MIN_NOTIONAL) {
+        const crossing = !prevDipped;
+        prevDipped = true;
+        if (crossing) {
+          pendingKind = 'main';
+          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+        }
+      }
+      // Dipped but gated, or a continuing episode: fall through to the
+      // fallback check below only when the main rule cannot fire at all
+      // (it can still fire later in this episode once the gates open, so
+      // the fallback must not steal a dipped bar from it).
+      if (seq <= LAST_ENTRY_SEQ) return [];
+    }
+
+    // Flat: the guardrail fallback. It arms only when nothing has ever
+    // filled and the window is nearly over.
+    if (state.warmingUp || fillsCount > 0 || seq < FB_ARM_SEQ || seq > FB_LAST_ENTRY_SEQ) return [];
+    if (seq < cooldownUntil || state.cash < MIN_NOTIONAL) return [];
+    const fbHigh = rollingHigh(FB_LOOKBACK_BARS);
+    if (fbHigh === null) return [];
+    const fbDipped = close * BPS <= fbHigh * (BPS - FB_DIP_BPS);
+    if (!fbDipped) {
+      prevFbDipped = false;
+      return [];
+    }
+    const fbCrossing = !prevFbDipped;
+    prevFbDipped = true;
+    if (!fbCrossing) return [];
+    pendingKind = 'fallback';
     return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
   },
 });
